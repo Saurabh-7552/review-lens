@@ -29,6 +29,7 @@ export interface PullRequest {
   number: number;
   title: string;
   headRefName: string;
+  headRefOid?: string;
   baseRefName: string;
   author: { login: string; name?: string };
   body: string;
@@ -43,6 +44,7 @@ export interface ListedTarget {
   title: string;
   pr?: PullRequest;
   requested: boolean;
+  newCommits?: boolean;
   progress?: { viewed: number; total: number; verdict?: Verdict | null };
 }
 export type ViewedState = "VIEWED" | "UNVIEWED" | "DISMISSED";
@@ -52,6 +54,7 @@ export interface ViewedStates {
   files: Record<string, ViewedState>;
 }
 export type Badge = "todo" | "viewed" | "changed";
+export const prKey = (number: number) => `pr-${number}`;
 export const badge = (meta: ReviewMeta, change: FileChange): Badge =>
   !Object.hasOwn(meta.reviewed, change.path)
     ? "todo"
@@ -139,8 +142,55 @@ export function toPost(drafts: Draft[], changes: FileChange[]): Draft[] {
   return drafts.filter(
     (d) =>
       !d.posted &&
+      !d.replyTo &&
       changes.some((c) => c.path === d.path && c.newBlob === d.blob),
   );
+}
+export function repliesToPost(
+  drafts: Draft[],
+  threads: string[] | null,
+): Draft[] {
+  return drafts.filter(
+    (d) =>
+      !d.posted &&
+      !!d.replyTo &&
+      (threads === null || threads.includes(d.replyTo)),
+  );
+}
+export function syncViewedState(
+  meta: ReviewMeta,
+  states: ViewedStates,
+  changes: FileChange[],
+  send: (path: string, viewed: boolean) => boolean,
+): ReviewMeta {
+  const queued = meta.unsent ?? {},
+    unsent: Record<string, boolean> = {};
+  for (const [path, viewed] of Object.entries(queued)) {
+    if (Object.hasOwn(states.files, path) && !send(path, viewed))
+      Object.defineProperty(unsent, path, { value: viewed, enumerable: true });
+  }
+  return {
+    ...meta,
+    reviewed: mergeViewed(meta, states, changes, queued),
+    unsent: Object.keys(unsent).length ? unsent : null,
+  };
+}
+export function suggestionParts(
+  body: string,
+): ({ text: string } | { suggestion: string[] })[] {
+  const parts: ({ text: string } | { suggestion: string[] })[] = [];
+  const pattern = /^```suggestion\r?\n([\s\S]*?)^```[ \t]*$/gm;
+  let end = 0;
+  for (const match of body.matchAll(pattern)) {
+    const text = body.slice(end, match.index).trim();
+    if (text) parts.push({ text });
+    const lines = match[1].replace(/\r/g, "").replace(/\n$/, "");
+    parts.push({ suggestion: lines ? lines.split("\n") : [] });
+    end = match.index! + match[0].length;
+  }
+  const text = body.slice(end).trim();
+  if (text) parts.push({ text });
+  return parts;
 }
 export function submitBlocker(
   verdict: Verdict,

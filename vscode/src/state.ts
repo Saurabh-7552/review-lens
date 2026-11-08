@@ -3,10 +3,30 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export interface ReviewTarget { key: string; label: string; prNumber?: number | null; head: string; base: string }
-export interface ActiveReview { target: ReviewTarget; head: string; reviewBranch: string; originalRef: string; stashMessage?: string | null }
+export interface ReviewTarget {
+  key: string;
+  label: string;
+  prNumber?: number | null;
+  head: string;
+  base: string;
+}
+export interface ActiveReview {
+  target: ReviewTarget;
+  head: string;
+  reviewBranch: string;
+  originalRef: string;
+  stashMessage?: string | null;
+}
 /** A pending comment on `line`, or on `startLine`..`line` when lines were selected (spec/README.md, Comment). */
-export interface Draft { path: string; startLine?: number | null; line: number; blob: string; body: string; posted?: boolean; replyTo?: string | null }
+export interface Draft {
+  path: string;
+  startLine?: number | null;
+  line: number;
+  blob: string;
+  body: string;
+  posted?: boolean;
+  replyTo?: string | null;
+}
 export interface ReviewMeta {
   target: ReviewTarget;
   range: { from: string; to: string };
@@ -121,6 +141,30 @@ export function parseMeta(o: Json): ReviewMeta {
           (draft.posted === undefined || typeof draft.posted === "boolean"),
         "draft",
       );
+      requireState(
+        draft.replyTo == null || text(draft.replyTo),
+        "draft.replyTo",
+      );
+      requireState(
+        draft.startLine == null ||
+          (Number.isInteger(draft.startLine) &&
+            draft.startLine >= 1 &&
+            draft.startLine <= draft.line &&
+            !draft.replyTo),
+        "draft.startLine",
+      );
+    }
+  }
+  if (o.checked != null) {
+    record(o.checked);
+    for (const value of Object.values(o.checked)) {
+      record(value);
+      requireState(
+        text(value.hash) &&
+          Array.isArray(value.places) &&
+          value.places.every(text),
+        "checked",
+      );
     }
   }
   const meta = pick<ReviewMeta>(o, [
@@ -132,8 +176,29 @@ export function parseMeta(o: Json): ReviewMeta {
   ]);
   meta.target = target(o.target);
   meta.range = pick(o.range, ["from", "to"]);
-  if ("checked" in o) meta.checked = o.checked && Object.fromEntries(Object.entries(o.checked as Json).map(([k, v]: [string, any]) => [k, pick(v, ["hash", "places"])]));
-  if ("drafts" in o) meta.drafts = o.drafts && o.drafts.map((d: Json) => pick<Draft>(d, ["path", "startLine", "line", "blob", "body", "posted", "replyTo"]));
+  if ("checked" in o)
+    meta.checked =
+      o.checked &&
+      Object.fromEntries(
+        Object.entries(o.checked as Json).map(([k, v]: [string, any]) => [
+          k,
+          pick(v, ["hash", "places"]),
+        ]),
+      );
+  if ("drafts" in o)
+    meta.drafts =
+      o.drafts &&
+      o.drafts.map((d: Json) =>
+        pick<Draft>(d, [
+          "path",
+          "startLine",
+          "line",
+          "blob",
+          "body",
+          "posted",
+          "replyTo",
+        ]),
+      );
   return meta;
 }
 

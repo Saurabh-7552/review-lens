@@ -89,9 +89,9 @@ test("exit refuses new review edits and external branch changes without losing r
     lifecycle = new ReviewLifecycle(r.client, store);
   await lifecycle.start(target, r.head);
   await writeFile(path.join(r.root, "app.txt"), "external edit\n");
-  await assert.rejects(lifecycle.exit(), /has edits/);
-  assert.ok(await store.active());
-  await r.git("checkout", "--", "app.txt");
+  assert.equal(await lifecycle.exit(), "nothing");
+  assert.match(await r.git("stash", "list"), /changed during review/);
+  await lifecycle.start(target, r.head);
   await r.git("checkout", "-qb", "outside");
   await assert.rejects(lifecycle.exit(), /checkout is now/);
   assert.ok(await store.active());
@@ -114,6 +114,43 @@ class Offline extends GhClient {
     throw new Error("offline");
   }
 }
+
+test("tracked settings are parked while untracked settings stay put, and review-time settings get their own stash", async (t) => {
+  const r = await repository();
+  t.after(r.clean);
+  await mkdir(path.join(r.root, ".vscode"));
+  const file = path.join(r.root, ".vscode/settings.json");
+  await writeFile(file, "base");
+  await r.git("add", ".vscode/settings.json");
+  await r.git("commit", "-qm", "settings");
+  await r.git("checkout", "-qb", "settings-pr");
+  await writeFile(file, "pr");
+  await r.git("commit", "-qam", "PR settings");
+  const head = (await r.git("rev-parse", "HEAD")).trim();
+  await r.git("checkout", "main");
+  await writeFile(file, "mine");
+  await r.git("add", ".vscode/settings.json");
+  await writeFile(path.join(r.root, ".vscode/scratch.json"), "scratch");
+  const lifecycle = new ReviewLifecycle(
+    r.client,
+    new StateStore(r.client.gitDir),
+  );
+  await lifecycle.start(target, head);
+  assert.equal(await readFile(file, "utf8"), "pr");
+  assert.equal(
+    await readFile(path.join(r.root, ".vscode/scratch.json"), "utf8"),
+    "scratch",
+  );
+  await writeFile(file, "IDE rewrote this");
+  assert.equal(await lifecycle.exit(), "restored");
+  assert.deepEqual(lifecycle.changedPaths, [".vscode/settings.json"]);
+  assert.equal(await readFile(file, "utf8"), "mine");
+  assert.match(
+    await r.git("status", "--porcelain"),
+    /M  .vscode\/settings.json/,
+  );
+  assert.match(await r.git("stash", "list"), /changed during review/);
+});
 test("session re-scope preserves ticks and drafts, offline ticks persist, and fresh services resume", async (t) => {
   const r = await repository();
   t.after(r.clean);
@@ -121,6 +158,7 @@ test("session re-scope preserves ticks and drafts, offline ticks persist, and fr
   await r.git("update-ref", "refs/review-lens/pr-7", r.head);
   const loaded = await s.load(target, false);
   await s.begin(loaded);
+  await s.syncViewed();
   await s.toggle("app.txt");
   assert.equal(s.meta?.unsent?.["app.txt"], true);
   assert.match(s.sync, /failed/);
@@ -144,6 +182,8 @@ test("failed submissions retain drafts; accepted reviews post once; mark-only ke
   t.after(r.clean);
   await r.git("update-ref", "refs/review-lens/pr-7", r.head);
   const gh = new Offline(r.root);
+  gh.reviewThreads = async () => [];
+  gh.reviewSlot = async () => ({ id: "PR_7", head: r.head, own: false });
   let attempts = 0,
     accept = false;
   gh.submit = async (_number, payload: any) => {

@@ -11,6 +11,37 @@ async function main() {
   const temporary = path.join(extension, ".test-data", "editor-temp");
   await mkdir(temporary, { recursive: true });
   const repo = await repository();
+  await repo.git("checkout", "main");
+  await writeFile(
+    path.join(repo.root, "calc.ts"),
+    "export function calculate(value: number): number {\n  return value + 1;\n}\n",
+  );
+  await writeFile(
+    path.join(repo.root, "caller.ts"),
+    'import { calculate } from "./calc";\nexport function caller() {\n  return calculate(2);\n}\n',
+  );
+  await writeFile(
+    path.join(repo.root, "calc.test.ts"),
+    'import { calculate } from "./calc";\nexport function testCalculate() {\n  return calculate(3);\n}\n',
+  );
+  await writeFile(
+    path.join(repo.root, "tsconfig.json"),
+    '{"compilerOptions":{"strict":true}}',
+  );
+  await repo.git("add", ".");
+  await repo.git("commit", "-qm", "TypeScript base");
+  repo.base = (await repo.git("rev-parse", "HEAD")).trim();
+  await repo.git("checkout", "-B", "feature", repo.base);
+  await writeFile(path.join(repo.root, "app.txt"), "feature\n");
+  await writeFile(path.join(repo.root, "added.txt"), "new\n");
+  await writeFile(
+    path.join(repo.root, "calc.ts"),
+    "export function calculate(value: number): number {\n  return value + 2;\n}\n",
+  );
+  await repo.git("add", ".");
+  await repo.git("commit", "-qm", "Review change");
+  repo.head = (await repo.git("rev-parse", "HEAD")).trim();
+  await repo.git("checkout", "main");
   await repo.git("remote", "add", "origin", repo.root);
   await repo.git("update-ref", "refs/pull/7/head", repo.head);
   await repo.git("update-ref", "refs/remotes/origin/main", repo.base);

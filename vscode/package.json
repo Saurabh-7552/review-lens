@@ -112,6 +112,92 @@
         "title": "Delete draft",
         "category": "Review Lens",
         "icon": "$(trash)"
+      },
+      {
+        "command": "reviewLens.saveComment",
+        "title": "Save",
+        "category": "Review Lens"
+      },
+      {
+        "command": "reviewLens.cancelComment",
+        "title": "Cancel",
+        "category": "Review Lens"
+      },
+      {
+        "command": "reviewLens.suggest",
+        "title": "Suggest a change",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.resolveThread",
+        "title": "Resolve thread",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.unresolveThread",
+        "title": "Unresolve thread",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.editPosted",
+        "title": "Edit posted comment",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.savePosted",
+        "title": "Save posted comment",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.deletePosted",
+        "title": "Delete posted comment",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.impactPeek",
+        "title": "Show impact",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.impactToggle",
+        "title": "Check impact place",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.impactOpen",
+        "title": "Open impact place",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.impactUsages",
+        "title": "Find impact usages",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.impactNext",
+        "title": "Next unchecked impact place",
+        "category": "Review Lens",
+        "enablement": "reviewLens.active"
+      },
+      {
+        "command": "reviewLens.confirmDeletePosted",
+        "title": "Delete permanently",
+        "category": "Review Lens"
+      },
+      {
+        "command": "reviewLens.cancelDeletePosted",
+        "title": "Keep comment",
+        "category": "Review Lens"
       }
     ],
     "viewsContainers": {
@@ -153,6 +239,11 @@
       {
         "command": "reviewLens.diff",
         "key": "alt+d",
+        "when": "reviewLens.active && editorTextFocus"
+      },
+      {
+        "command": "reviewLens.impactNext",
+        "key": "alt+i",
         "when": "reviewLens.active && editorTextFocus"
       }
     ],
@@ -198,6 +289,67 @@
           "command": "reviewLens.deleteComment",
           "when": "commentController == review-lens && comment == draft",
           "group": "inline"
+        },
+        {
+          "command": "reviewLens.editPosted",
+          "when": "commentController == review-lens && comment =~ /editable/",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.deletePosted",
+          "when": "commentController == review-lens && comment =~ /deletable/",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.confirmDeletePosted",
+          "when": "commentController == review-lens && comment == confirmDelete",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.cancelDeletePosted",
+          "when": "commentController == review-lens && comment == confirmDelete",
+          "group": "inline"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "reviewLens.saveComment",
+          "when": "commentController == review-lens && comment == draft",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.cancelComment",
+          "when": "commentController == review-lens && comment == draft",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.savePosted",
+          "when": "commentController == review-lens && comment =~ /editable/",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.cancelComment",
+          "when": "commentController == review-lens && comment =~ /editable/",
+          "group": "inline"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "reviewLens.resolveThread",
+          "when": "commentController == review-lens && commentThread == resolve",
+          "group": "inline"
+        },
+        {
+          "command": "reviewLens.unresolveThread",
+          "when": "commentController == review-lens && commentThread == unresolve",
+          "group": "inline"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "reviewLens.suggest",
+          "when": "reviewLens.active && editorTextFocus",
+          "group": "reviewLens"
         }
       ]
     }

@@ -1,8 +1,9 @@
 import * as vscode from "vscode";
 import * as path from "node:path";
 import { ReviewService } from "../services/review";
-import { badge, FileChange } from "../core/model";
+import { badge, FileChange, suggestionParts } from "../core/model";
 import { Hunk } from "../core/parsers";
+import { anchored } from "../core/threads";
 /** Git snapshots are immutable and also serve as the left side of native diffs. */
 export class ReviewEditor
   implements
@@ -24,7 +25,7 @@ export class ReviewEditor
     ReturnType<ReviewService["git"]["blame"]>
   >();
   private scopeCommits?: Promise<Set<string>>;
-  private readOnlyAvailable?: Promise<boolean>;
+
   private readonly guarded = new Map<string, vscode.Uri>();
   private readonly markers: vscode.TextEditorDecorationType[];
   private readonly blameDecoration =
@@ -44,7 +45,11 @@ export class ReviewEditor
   constructor(
     readonly service: ReviewService,
     readonly extensionUri: vscode.Uri,
+    private readonly workspaceState?: vscode.Memento,
   ) {
+    for (const uri of workspaceState?.get<string[]>("reviewLens.guarded", []) ??
+      [])
+      this.guarded.set(uri, vscode.Uri.parse(uri));
     this.markers = (["added", "modified", "deleted"] as const).map((kind) =>
       vscode.window.createTextEditorDecorationType({
         isWholeLine: true,
@@ -100,7 +105,9 @@ export class ReviewEditor
           !this.isCurrent(document.uri)
         )
           return [];
-        return (await this.changedLines(change))
+        return (
+          await this.service.git.commentHunks(this.service.meta!.range, change)
+        )
           .filter((h) => h.count > 0)
           .map(
             (h) => new vscode.Range(h.start - 1, 0, h.start + h.count - 2, 0),
@@ -154,16 +161,6 @@ export class ReviewEditor
       ? "Binary file — use the file's native viewer.\n"
       : text;
   }
-  async ensureReadOnlyAvailable() {
-    // The built-in session command keeps real file URIs, language services, and user settings intact.
-    return (this.readOnlyAvailable ??= Promise.resolve(
-      vscode.commands.getCommands(true),
-    ).then((commands) =>
-      commands.includes(
-        "workbench.action.files.setActiveEditorReadonlyInSession",
-      ),
-    ));
-  }
   async open(file: string, diff = false) {
     if (this.service.recovery) throw new Error(this.service.recovery);
     const meta = this.service.meta;
@@ -186,9 +183,7 @@ export class ReviewEditor
       );
       return;
     }
-    const uri = (await this.ensureReadOnlyAvailable())
-      ? vscode.Uri.file(this.service.git.file(file))
-      : this.uri(meta.range.to, file);
+    const uri = vscode.Uri.file(this.service.git.file(file));
     await vscode.window.showTextDocument(uri, { preview: false });
     if (vscode.window.activeTextEditor)
       await this.paint(vscode.window.activeTextEditor);
@@ -217,45 +212,44 @@ export class ReviewEditor
   }
   private async guard(editor: vscode.TextEditor) {
     if (
+      !this.service.active &&
+      vscode.window.activeTextEditor === editor &&
+      this.guarded.has(editor.document.uri.toString())
+    ) {
+      await vscode.commands.executeCommand(
+        "workbench.action.files.resetActiveEditorReadonlyInSession",
+      );
+      this.guarded.delete(editor.document.uri.toString());
+      await this.workspaceState?.update("reviewLens.guarded", [
+        ...this.guarded.keys(),
+      ]);
+    }
+    if (
       !this.service.meta ||
       editor.document.uri.scheme !== "file" ||
       !this.relative(editor.document.uri)
     )
       return;
     if (vscode.window.activeTextEditor !== editor) return;
-    if (await this.ensureReadOnlyAvailable()) {
-      if (vscode.window.activeTextEditor !== editor || !this.service.meta)
-        return;
-      await vscode.commands.executeCommand(
-        "workbench.action.files.setActiveEditorReadonlyInSession",
-      );
-      this.guarded.set(editor.document.uri.toString(), editor.document.uri);
-    } else {
-      // Old hosts/forks without the command use a truly immutable content-provider editor.
-      const file = this.relative(editor.document.uri)!;
-      if (!editor.document.isDirty)
-        await vscode.window.showTextDocument(
-          this.uri(this.service.meta.range.to, file),
-          { preview: false },
-        );
-    }
+    await vscode.commands.executeCommand(
+      "workbench.action.files.setActiveEditorReadonlyInSession",
+    );
+    this.guarded.set(editor.document.uri.toString(), editor.document.uri);
+    await this.workspaceState?.update("reviewLens.guarded", [
+      ...this.guarded.keys(),
+    ]);
   }
   async releaseGuards() {
-    const selected = vscode.window.activeTextEditor?.document.uri;
-    for (const uri of this.guarded.values()) {
-      try {
-        await vscode.window.showTextDocument(uri, {
-          preview: false,
-          preserveFocus: false,
-        });
-        await vscode.commands.executeCommand(
-          "workbench.action.files.resetActiveEditorReadonlyInSession",
-        );
-      } catch {
-        /* A file deleted by checkout no longer has an editor. */
-      }
+    const selected = vscode.window.activeTextEditor;
+    if (selected && this.guarded.has(selected.document.uri.toString())) {
+      await vscode.commands.executeCommand(
+        "workbench.action.files.resetActiveEditorReadonlyInSession",
+      );
+      this.guarded.delete(selected.document.uri.toString());
     }
-    this.guarded.clear();
+    await this.workspaceState?.update("reviewLens.guarded", [
+      ...this.guarded.keys(),
+    ]);
     const tabs = vscode.window.tabGroups.all
       .flatMap((g) => g.tabs)
       .filter(
@@ -267,11 +261,6 @@ export class ReviewEditor
             t.input.uri.scheme === "review-lens"),
       );
     if (tabs.length) await vscode.window.tabGroups.close(tabs);
-    if (selected?.scheme === "file")
-      await vscode.window.showTextDocument(selected, { preview: false }).then(
-        () => {},
-        () => {},
-      );
   }
   async refresh() {
     const scope = this.service.meta
@@ -437,22 +426,102 @@ export class ReviewEditor
     commands.push({ title: "Exit review", command: "reviewLens.exit" });
     return commands.map((command) => new vscode.CodeLens(range, command));
   }
-  private async renderComments() {
+  private preview(body: string, original?: string) {
+    const markdown = new vscode.MarkdownString();
+    for (const part of suggestionParts(body)) {
+      if ("text" in part) markdown.appendMarkdown(part.text + "\n\n");
+      else {
+        const removed = original?.split("\n").map((line) => "- " + line) ?? [];
+        markdown.appendCodeblock(
+          [...removed, ...part.suggestion.map((line) => "+ " + line)].join(
+            "\n",
+          ),
+          "diff",
+        );
+      }
+    }
+    return markdown;
+  }
+  confirmDelete(comment: vscode.Comment & { id: string }, confirm: boolean) {
+    const source = this.service.threads
+      .flatMap((t) => t.comments)
+      .find((c) => c.id === comment.id);
+    if (!source?.canDelete)
+      throw new Error("GitHub does not allow deleting this comment.");
+    comment.contextValue = confirm
+      ? "confirmDelete"
+      : (source.canEdit ? "editable " : "") + "deletable";
+    comment.label = confirm
+      ? "Delete this public comment permanently?"
+      : undefined;
+    for (const thread of this.threads)
+      if (thread.comments.includes(comment))
+        thread.comments = [...thread.comments];
+  }
+  private renderQueue: Promise<void> = Promise.resolve();
+  private renderComments() {
+    const job = this.renderQueue.then(() => this.renderCommentsNow());
+    this.renderQueue = job.catch(() => {});
+    return job;
+  }
+  private async renderCommentsNow() {
     // Do not replace native reply editors on a progress event: preserve unsaved typing.
-    const signature = JSON.stringify([this.range, this.service.meta?.drafts]);
+    const signature = JSON.stringify([
+      this.range,
+      this.service.meta?.drafts,
+      this.service.threads,
+      this.service.threadsKnown,
+    ]);
     if (signature === this.commentSignature) return;
     this.commentSignature = signature;
-    this.threads.forEach((t) => t.dispose());
+    await this.service.refreshCovered();
+    if (signature !== this.commentSignature) return;
+    const previous = this.threads;
     this.threads = [];
+    const reuse = (
+      key: string,
+      uri: vscode.Uri,
+      range: vscode.Range,
+      comments: vscode.Comment[],
+    ) => {
+      const thread = previous.find(
+        (t) => (t as vscode.CommentThread & { key?: string }).key === key,
+      );
+      if (!thread) {
+        const created = this.controller.createCommentThread(
+          uri,
+          range,
+          comments,
+        );
+        (created as vscode.CommentThread & { key?: string }).key = key;
+        return created;
+      }
+      thread.range = range;
+      thread.comments = comments.map(
+        (c) =>
+          thread.comments.find(
+            (old) =>
+              old.mode === vscode.CommentMode.Editing &&
+              ((c as any).id
+                ? (old as any).id === (c as any).id
+                : (old as any).index === (c as any).index),
+          ) ?? c,
+      );
+      return thread;
+    };
     const meta = this.service.meta;
-    if (!meta || meta.target.prNumber == null || this.service.recovery) return;
-    const native = await this.ensureReadOnlyAvailable();
+    if (!meta || meta.target.prNumber == null || this.service.recovery) {
+      previous.forEach((t) => t.dispose());
+      return;
+    }
+
     if (signature !== this.commentSignature) return;
     const groups = new Map<
       string,
       { index: number; draft: NonNullable<typeof meta.drafts>[number] }[]
     >();
     meta.drafts?.forEach((draft, index) => {
+      if (draft.replyTo || (draft.posted && this.service.threadsKnown)) return;
       if (
         this.service.changes.some(
           (c) => c.path === draft.path && c.newBlob === draft.blob,
@@ -464,16 +533,20 @@ export class ReviewEditor
     });
     for (const group of groups.values()) {
       const { draft } = group[0];
-      const uri = native
-        ? vscode.Uri.file(this.service.git.file(draft.path))
-        : this.uri(meta.range.to, draft.path);
-      const thread = this.controller.createCommentThread(
+      const uri = vscode.Uri.file(this.service.git.file(draft.path));
+      const thread = reuse(
+        `draft:${draft.path}:${draft.line}`,
         uri,
-        new vscode.Range(draft.line - 1, 0, draft.line - 1, 0),
+        new vscode.Range(
+          (draft.startLine ?? draft.line) - 1,
+          0,
+          draft.line - 1,
+          0,
+        ),
         group.map(
           ({ draft: d, index }) =>
             ({
-              body: d.body,
+              body: this.preview(d.body, this.service.covered[index]),
               mode: vscode.CommentMode.Preview,
               author: { name: "You" },
               label: d.posted ? "On GitHub" : "Pending",
@@ -487,16 +560,121 @@ export class ReviewEditor
       this.threads.push(thread);
       thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
     }
+    for (const posted of this.service.threads) {
+      if (!anchored(posted, meta.range.to)) continue;
+      const comments: vscode.Comment[] = posted.comments.map(
+        (c) =>
+          ({
+            body: this.preview(c.body, posted.originalText),
+            mode: vscode.CommentMode.Preview,
+            author: { name: c.author },
+            contextValue: `${c.canEdit ? "editable" : ""}${c.canDelete ? " deletable" : ""}`,
+            id: c.id,
+          }) as vscode.Comment,
+      );
+      meta.drafts?.forEach((d, index) => {
+        if (d.replyTo === posted.id && !d.posted)
+          comments.push({
+            body: this.preview(d.body, this.service.covered[index]),
+            mode: vscode.CommentMode.Preview,
+            author: { name: "You" },
+            label: "Pending reply",
+            contextValue: "draft",
+            index,
+          } as vscode.Comment);
+      });
+      const thread = reuse(
+        "host:" + posted.id,
+        vscode.Uri.file(this.service.git.file(posted.path)),
+        new vscode.Range(
+          (posted.startLine ?? posted.line!) - 1,
+          0,
+          posted.line! - 1,
+          0,
+        ),
+        comments,
+      );
+      (thread as vscode.CommentThread & { hostId: string }).hostId = posted.id;
+      thread.label = posted.isResolved
+        ? `Resolved${posted.resolvedBy ? " by " + posted.resolvedBy : ""}`
+        : "GitHub thread";
+      thread.contextValue = posted.isResolved
+        ? posted.viewerCanUnresolve
+          ? "unresolve"
+          : ""
+        : posted.viewerCanResolve
+          ? "resolve"
+          : "";
+      thread.canReply = !posted.isResolved;
+      thread.collapsibleState = posted.isResolved
+        ? vscode.CommentThreadCollapsibleState.Collapsed
+        : vscode.CommentThreadCollapsibleState.Expanded;
+      this.threads.push(thread);
+    }
+    previous
+      .filter((t) => !this.threads.includes(t))
+      .forEach((t) => t.dispose());
+  }
+  async editDraft(index: number) {
+    const draft = this.service.meta?.drafts?.[index];
+    if (!draft || draft.posted) return;
+    await this.open(draft.path);
+    await this.refresh();
+    const editor = vscode.window.activeTextEditor;
+    if (editor)
+      editor.revealRange(
+        new vscode.Range(draft.line - 1, 0, draft.line - 1, 0),
+      );
+    for (const thread of this.threads) {
+      const comments = [...thread.comments];
+      const comment = comments.find(
+        (c) => (c as vscode.Comment & { index?: number }).index === index,
+      );
+      if (comment) {
+        comment.body = draft.body;
+        comment.mode = vscode.CommentMode.Editing;
+        thread.comments = comments;
+        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+      }
+    }
+  }
+  async cancelEdit() {
+    for (const thread of this.threads)
+      thread.comments = thread.comments.map((comment) => {
+        const draft =
+          this.service.meta?.drafts?.[
+            (comment as vscode.Comment & { index: number }).index
+          ];
+        return {
+          ...comment,
+          body:
+            draft?.body ??
+            this.service.threads
+              .flatMap((t) => t.comments)
+              .find(
+                (c) =>
+                  c.id === (comment as vscode.Comment & { id?: string }).id,
+              )?.body ??
+            comment.body,
+          mode: vscode.CommentMode.Preview,
+        };
+      });
+    this.commentSignature = "";
+    await this.refresh();
   }
   private commentSignature = "";
   async addReply(reply: vscode.CommentReply) {
+    const id = (reply.thread as vscode.CommentThread & { hostId?: string })
+      .hostId;
+    if (id) return this.service.reply(id, reply.text);
     const file = this.relative(reply.thread.uri);
     if (!file || !reply.thread.range)
       throw new Error("No changed line selected.");
     await this.service.addDraft(
       file,
-      reply.thread.range.start.line + 1,
+      reply.thread.range.end.line + 1,
       reply.text,
+      reply.thread.range.start.line + 1,
     );
     // A newly created empty thread belongs to VS Code; remove it after persisted drafts render.
     if (!reply.thread.comments.length) reply.thread.dispose();
@@ -504,5 +682,64 @@ export class ReviewEditor
   dispose() {
     this.threads.forEach((t) => t.dispose());
     this.disposables.forEach((d) => d.dispose());
+  }
+  async editPosted(id: string) {
+    const posted = this.service.threads.find((t) =>
+      t.comments.some((c) => c.id === id),
+    );
+    if (!posted) return;
+    if (!anchored(posted, this.service.meta?.range.to ?? ""))
+      throw new Error(
+        "This comment is not anchored to the current scope. Open its scope before editing inline.",
+      );
+    await this.open(posted.path);
+    for (const thread of this.threads) {
+      const comments = [...thread.comments],
+        comment = comments.find(
+          (c) => (c as vscode.Comment & { id?: string }).id === id,
+        );
+      if (comment) {
+        comment.body = posted.comments.find((c) => c.id === id)!.body;
+        comment.mode = vscode.CommentMode.Editing;
+        thread.comments = comments;
+        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+      }
+    }
+  }
+  async savePosted(comment: vscode.Comment & { id: string }) {
+    const body =
+      typeof comment.body === "string" ? comment.body : comment.body.value;
+    try {
+      await this.service.postedComment(comment.id, body);
+      comment.mode = vscode.CommentMode.Preview;
+      this.commentSignature = "";
+      await this.refresh();
+    } catch (error) {
+      comment.mode = vscode.CommentMode.Editing;
+      throw error;
+    }
+  }
+  async suggest() {
+    const editor = vscode.window.activeTextEditor,
+      file = editor && this.relative(editor.document.uri);
+    if (!editor || !file) return;
+    const selection = editor.selection;
+    const end =
+      selection.end.character === 0 && !selection.isEmpty
+        ? Math.max(selection.start.line, selection.end.line - 1)
+        : selection.end.line;
+    const range = new vscode.Range(
+      selection.start.line,
+      0,
+      end,
+      editor.document.lineAt(end).text.length,
+    );
+    await this.service.addDraft(
+      file,
+      end + 1,
+      "```suggestion\n" + editor.document.getText(range) + "\n```",
+      selection.start.line + 1,
+    );
+    await this.editDraft((this.service.meta?.drafts?.length ?? 1) - 1);
   }
 }

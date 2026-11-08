@@ -13,7 +13,11 @@ import {
   reviewPayload,
   submitBlocker,
   toPost,
+  prKey,
+  syncViewedState,
+  repliesToPost,
 } from "../core/model";
+import { ReviewThread, ReviewSlot, slotBlocker } from "../core/threads";
 import { GitClient } from "../infrastructure/git";
 import { GhClient } from "../infrastructure/github";
 import { StateStore } from "../infrastructure/store";
@@ -30,6 +34,16 @@ export class ReviewService extends EventEmitter {
   busy = false;
   step = "";
   recovery?: string;
+  threads: ReviewThread[] = [];
+  threadsKnown = false;
+  threadError?: string;
+  slot?: ReviewSlot;
+  covered: Record<number, string> = {};
+  impactAnalysisComplete = false;
+  readonly impactKeys = new Set<string>();
+  private viewedHost?: { key: string; id: string; files: Set<string> };
+  private readonly viewedSends = new Map<string, Promise<void>>();
+  private readonly viewedVersions = new Map<string, number>();
   private tail: Promise<unknown> = Promise.resolve();
   constructor(
     readonly git: GitClient,
@@ -61,6 +75,10 @@ export class ReviewService extends EventEmitter {
   private async reload() {
     this.recovery = undefined;
     this.active = await this.store.active();
+    this.impactKeys.clear();
+    this.threads = [];
+    this.threadsKnown = false;
+    this.slot = undefined;
     this.meta = this.active
       ? await this.store.meta(this.active.target.key)
       : undefined;
@@ -95,7 +113,7 @@ export class ReviewService extends EventEmitter {
       const me = await this.gh.viewer().catch(() => "");
       targets = prs.map((pr) => ({
         target: {
-          key: `pr-${pr.number}`,
+          key: prKey(pr.number),
           label: `#${pr.number} ${pr.title}`,
           prNumber: pr.number,
           head: pr.headRefName,
@@ -118,6 +136,9 @@ export class ReviewService extends EventEmitter {
     for (const target of targets) {
       const saved = await this.store.meta(target.target.key);
       if (!saved) continue;
+      target.newCommits =
+        !!target.pr?.headRefOid &&
+        target.pr.headRefOid !== (saved.seenHead ?? saved.range.to);
       const changes = await this.git
         .changes(saved.range)
         .catch(() => undefined);
@@ -210,9 +231,18 @@ export class ReviewService extends EventEmitter {
       try {
         const states = await this.gh.viewed(meta.target.prNumber);
         this.own = states.own;
+        this.viewedHost = {
+          key: meta.target.key,
+          id: states.id,
+          files: new Set(Object.keys(states.files)),
+        };
         const queued = { ...meta.unsent },
           unsent = { ...queued };
         for (const [file, viewed] of Object.entries(queued)) {
+          if (!Object.hasOwn(states.files, file)) {
+            delete unsent[file];
+            continue;
+          }
           try {
             await this.gh.setViewed(states.id, file, viewed);
             delete unsent[file];
@@ -221,11 +251,14 @@ export class ReviewService extends EventEmitter {
           }
         }
         // The response was fetched before re-sends; queued local answers win over that stale response.
-        await this.save({
-          ...meta,
-          reviewed: mergeViewed(meta, states, this.changes, queued),
-          unsent: Object.keys(unsent).length ? unsent : null,
-        });
+        await this.save(
+          syncViewedState(
+            meta,
+            states,
+            this.changes,
+            (path) => !Object.hasOwn(unsent, path),
+          ),
+        );
         this.sync = Object.keys(unsent).length
           ? "GitHub sync failed · kept on this laptop"
           : "Synced with GitHub";
@@ -235,7 +268,7 @@ export class ReviewService extends EventEmitter {
     });
   }
   async toggle(file: string) {
-    await this.exclusive(async () => {
+    const sending = await this.exclusive(async () => {
       const meta = this.meta,
         change = this.changes.find((c) => c.path === file);
       if (!meta || !change) throw new Error("File is not in this scope.");
@@ -250,15 +283,52 @@ export class ReviewService extends EventEmitter {
       await this.save({
         ...meta,
         reviewed,
-        ...(meta.target.prNumber != null
+        ...(meta.target.prNumber != null &&
+        (!this.viewedHost || this.viewedHost.files.has(file))
           ? { unsent: { ...meta.unsent, [file]: viewed } }
           : {}),
       });
+      const version = (this.viewedVersions.get(file) ?? 0) + 1;
+      this.viewedVersions.set(file, version);
+      return { meta, viewed, active: this.active, version };
     });
-    // Local update completes before the network operation is queued.
-    return this.syncViewed();
+    const host = this.viewedHost;
+    if (!host || host.key !== sending.meta.target.key || !host.files.has(file))
+      return;
+    const key = host.key + ":" + file;
+    const job = (this.viewedSends.get(key) ?? Promise.resolve()).then(
+      async () => {
+        if (this.active !== sending.active) return;
+        try {
+          await this.gh.setViewed(host.id, file, sending.viewed);
+          await this.exclusive(async () => {
+            if (this.viewedVersions.get(file) !== sending.version) return;
+            if (
+              this.active !== sending.active ||
+              this.meta?.unsent?.[file] !== sending.viewed
+            )
+              return;
+            const unsent = { ...this.meta.unsent };
+            delete unsent[file];
+            await this.save({
+              ...this.meta,
+              unsent: Object.keys(unsent).length ? unsent : null,
+            });
+          });
+        } catch {
+          if (this.active === sending.active) {
+            this.sync = "GitHub sync failed · kept on this laptop";
+            this.emit("change");
+          }
+        }
+      },
+    );
+    this.viewedSends.set(key, job);
+    void job.finally(() => {
+      if (this.viewedSends.get(key) === job) this.viewedSends.delete(key);
+    });
   }
-  async addDraft(file: string, line: number, body: string) {
+  async addDraft(file: string, line: number, body: string, startLine?: number) {
     return this.exclusive(async () => {
       const meta = this.meta,
         change = this.changes.find((c) => c.path === file);
@@ -273,10 +343,18 @@ export class ReviewService extends EventEmitter {
         throw new Error("Invalid draft comment.");
       if (!this.active) throw new Error("No active review.");
       await this.lifecycle.assertCheckout(this.active);
-      const hunks = await this.git.hunks(meta.range, change);
+      if (
+        startLine !== undefined &&
+        (!Number.isInteger(startLine) || startLine < 1 || startLine > line)
+      )
+        throw new Error("Invalid comment range.");
+      const hunks = await this.git.commentHunks(meta.range, change);
       if (
         !hunks.some(
-          (h) => h.count > 0 && line >= h.start && line < h.start + h.count,
+          (h) =>
+            h.count > 0 &&
+            (startLine ?? line) >= h.start &&
+            line < h.start + h.count,
         )
       )
         throw new Error(
@@ -292,8 +370,174 @@ export class ReviewService extends EventEmitter {
             blob: change.newBlob,
             body: body.trim(),
             posted: false,
+            ...(startLine !== undefined && startLine !== line
+              ? { startLine }
+              : {}),
           },
         ],
+      });
+    });
+  }
+  async refreshThreads() {
+    const active = this.active,
+      meta = this.meta,
+      number = meta?.target.prNumber;
+    if (!active || !meta || number == null) return;
+    try {
+      const threads = await this.gh.reviewThreads(number);
+      if (this.active !== active) return;
+      const loaded = await Promise.all(
+        threads.map(async (thread) => {
+          if (
+            thread.line == null ||
+            thread.diffSide !== "RIGHT" ||
+            thread.comments[0]?.commit !== meta.range.to
+          )
+            return thread;
+          const text = await this.git
+            .show(meta.range.to, thread.path)
+            .catch(() => "");
+          return {
+            ...thread,
+            originalText: text
+              .split(/\r?\n/)
+              .slice((thread.startLine ?? thread.line) - 1, thread.line)
+              .join("\n"),
+          };
+        }),
+      );
+      if (this.active !== active) return;
+      this.threads = loaded;
+      this.threadsKnown = true;
+      this.threadError = undefined;
+    } catch (error) {
+      if (this.active !== active) return;
+      this.threadsKnown = false;
+      this.threadError = error instanceof Error ? error.message : String(error);
+    }
+    this.emit("change");
+  }
+  private coveredMeta?: ReviewMeta;
+  private covering?: Promise<void>;
+  async refreshCovered() {
+    if (this.coveredMeta === this.meta) return this.covering;
+    this.coveredMeta = this.meta;
+    this.covering = this.loadCovered();
+    return this.covering;
+  }
+  private async loadCovered() {
+    const meta = this.meta;
+    if (!meta) return;
+    const covered: Record<number, string> = {};
+    await Promise.all(
+      (meta.drafts ?? []).map(async (d, index) => {
+        const change = this.changes.find(
+          (c) => c.path === d.path && c.newBlob === d.blob,
+        );
+        if (!change || d.replyTo) return;
+        const text = await this.git.show(meta.range.to, d.path).catch(() => "");
+        covered[index] = text
+          .split(/\r?\n/)
+          .slice((d.startLine ?? d.line) - 1, d.line)
+          .join("\n");
+      }),
+    );
+    if (this.meta === meta) this.covered = covered;
+  }
+  async prepareFinish() {
+    await this.refreshThreads();
+    const active = this.active,
+      number = this.meta?.target.prNumber;
+    if (!active || number == null) return;
+    const slot = await this.gh.reviewSlot(number);
+    if (this.active === active) {
+      this.slot = slot;
+      this.own = slot.own;
+      this.emit("change");
+    }
+  }
+  outbox() {
+    const drafts = this.meta?.drafts ?? [];
+    return {
+      comments: toPost(drafts, this.changes),
+      replies: repliesToPost(
+        drafts,
+        this.threadsKnown
+          ? this.threads.filter((t) => !t.isResolved).map((t) => t.id)
+          : null,
+      ),
+    };
+  }
+  async reply(threadId: string, body: string) {
+    return this.exclusive(async () => {
+      const meta = this.meta,
+        thread = this.threads.find((t) => t.id === threadId);
+      if (!meta || !thread || thread.isResolved || !body.trim())
+        throw new Error("Reply needs an open thread and nonempty text.");
+      const change = this.changes.find((c) => c.path === thread.path);
+      const blob =
+        change?.newBlob ??
+        (
+          await this.git
+            .git("rev-parse", `${meta.range.to}:${thread.path}`)
+            .catch(() => "0".repeat(40))
+        ).trim();
+      await this.save({
+        ...meta,
+        drafts: [
+          ...(meta.drafts ?? []),
+          {
+            path: thread.path,
+            line: thread.line ?? thread.originalLine ?? 1,
+            blob,
+            body: body.trim(),
+            replyTo: thread.id,
+            posted: false,
+          },
+        ],
+      });
+    });
+  }
+  async resolveThread(id: string, resolved: boolean) {
+    await this.exclusive(async () => {
+      const thread = this.threads.find((t) => t.id === id);
+      if (
+        !thread ||
+        !(resolved ? thread.viewerCanResolve : thread.viewerCanUnresolve)
+      )
+        throw new Error("GitHub does not allow this thread action.");
+      await this.gh.resolveThread(id, resolved);
+    });
+    await this.refreshThreads();
+  }
+  async postedComment(id: string, body?: string) {
+    await this.exclusive(async () => {
+      const comment = this.threads
+        .flatMap((t) => t.comments)
+        .find((c) => c.id === id);
+      if (
+        !comment ||
+        !(body === undefined ? comment.canDelete : comment.canEdit)
+      )
+        throw new Error("GitHub does not allow this comment action.");
+      if (body !== undefined && !body.trim())
+        throw new Error("Comment cannot be blank.");
+      if (body === undefined) await this.gh.deleteComment(id);
+      else await this.gh.editComment(id, body);
+    });
+    await this.refreshThreads();
+  }
+  async updateChecked(key: string, hash: string, place: string) {
+    return this.exclusive(async () => {
+      const meta = this.meta;
+      if (!meta) return;
+      const previous = meta.checked?.[key],
+        places = new Set(previous?.hash === hash ? previous.places : []);
+      if (places.has(place)) places.delete(place);
+      else places.add(place);
+      await this.save({
+        ...meta,
+        checked: { ...meta.checked, [key]: { hash, places: [...places] } },
       });
     });
   }
@@ -318,7 +562,17 @@ export class ReviewService extends EventEmitter {
     });
   }
   private async end(): Promise<Restored> {
+    const meta = this.meta;
     const result = await this.lifecycle.exit();
+    if (meta?.checked && this.impactAnalysisComplete)
+      await this.store.saveMeta({
+        ...meta,
+        checked: Object.fromEntries(
+          Object.entries(meta.checked).filter(([key]) =>
+            this.impactKeys.has(key),
+          ),
+        ),
+      });
     await this.reload();
     return result;
   }
@@ -332,18 +586,19 @@ export class ReviewService extends EventEmitter {
         throw new Error("Only pull requests can be submitted.");
       if (verdict) {
         await this.lifecycle.assertCheckout(this.active!);
-        const sending = toPost(meta.drafts ?? [], this.changes);
-        const blocker = submitBlocker(
-          verdict,
+        await this.refreshThreads();
+        const outbox = this.outbox(),
+          sending = [...outbox.comments, ...outbox.replies];
+        const submission = {
+          commit: meta.range.to,
           summary,
-          sending.length,
-          this.own,
-        );
+          verdict,
+          ...outbox,
+        };
+        this.slot = await this.gh.reviewSlot(meta.target.prNumber);
+        const blocker = slotBlocker(this.slot, submission);
         if (blocker) throw new Error(blocker);
-        await this.gh.submit(
-          meta.target.prNumber,
-          reviewPayload(meta.range.to, summary, verdict, sending),
-        );
+        await this.gh.submit(meta.target.prNumber, submission);
         await this.save({
           ...meta,
           verdict,

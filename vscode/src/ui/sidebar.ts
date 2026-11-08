@@ -29,6 +29,7 @@ export class ReviewSidebar
   private operation = false;
   private readonly change = () => {
     this.post();
+    void this.service.refreshCovered().then(() => this.post());
   };
   private readonly subscriptions: vscode.Disposable[] = [];
   constructor(
@@ -79,7 +80,11 @@ export class ReviewSidebar
     this.error = "";
     this.post();
     try {
-      if (this.service.active) await this.service.syncViewed();
+      if (this.service.active)
+        await Promise.all([
+          this.service.syncViewed(),
+          this.service.refreshThreads(),
+        ]);
       else if (this.selected) await this.fetchSelected();
       else {
         const list = await this.service.list();
@@ -110,6 +115,7 @@ export class ReviewSidebar
     this.checks = checks;
   }
   async reveal(finish = false) {
+    if (finish) await this.service.prepareFinish();
     await vscode.commands.executeCommand("workbench.view.extension.reviewLens");
     this.view?.show?.(true);
     this.post(finish);
@@ -128,6 +134,11 @@ export class ReviewSidebar
       state: {
         active: s.active,
         meta,
+        covered: s.covered,
+        threads: s.threads,
+        threadsKnown: s.threadsKnown,
+        threadError: s.threadError,
+        slot: s.slot,
         recovery: s.recovery,
         changes: s.changes.map((c) => ({
           ...c,
@@ -150,10 +161,11 @@ export class ReviewSidebar
         loading: this.loading,
         error: this.error,
         park: this.park,
-        pending: meta ? toPost(meta.drafts ?? [], s.changes).length : 0,
+        pending: s.outbox().comments.length + s.outbox().replies.length,
         waiting: meta
           ? (meta.drafts ?? []).filter((d) => !d.posted).length -
-            toPost(meta.drafts ?? [], s.changes).length
+            s.outbox().comments.length -
+            s.outbox().replies.length
           : 0,
         current: vscode.window.activeTextEditor
           ? this.editor.relative(vscode.window.activeTextEditor.document.uri)
@@ -192,6 +204,31 @@ export class ReviewSidebar
     this.post();
     try {
       switch (message.action) {
+        case "prepareFinish":
+          await this.service.prepareFinish();
+          this.post(true);
+          break;
+        case "refreshThreads":
+          await this.service.refreshThreads();
+          break;
+        case "resolve":
+          await this.service.resolveThread(
+            String(message.id),
+            message.resolved === true,
+          );
+          break;
+        case "reply":
+          if (typeof message.body === "string")
+            await this.service.reply(String(message.id), message.body);
+          break;
+        case "savePosted":
+          if (typeof message.body === "string")
+            await this.service.postedComment(String(message.id), message.body);
+          break;
+        case "deletePosted":
+          if (message.confirm === true)
+            await this.service.postedComment(String(message.id));
+          break;
         case "refresh":
           await this.refresh();
           break;
@@ -231,7 +268,10 @@ export class ReviewSidebar
             this.service.changes[0]?.path ??
             this.service.tracked[0];
           if (first) await this.editor.open(first);
-          await this.service.syncViewed();
+          await Promise.all([
+            this.service.syncViewed(),
+            this.service.refreshThreads(),
+          ]);
           break;
         }
         case "cancelPark":
@@ -294,15 +334,16 @@ export class ReviewSidebar
           if (!Number.isInteger(index)) throw new Error("Invalid draft.");
           const draft = this.service.meta?.drafts?.[index];
           if (!draft || draft.posted) break;
-          const body = await vscode.window.showInputBox({
-            title: "Edit draft comment",
-            value: draft.body,
-            validateInput: (value) =>
-              value.trim() ? undefined : "Comment cannot be blank.",
-          });
-          if (body !== undefined) await this.service.editDraft(index, body);
+          await this.editor.editDraft(index);
           break;
         }
+        case "saveDraft":
+          if (
+            Number.isInteger(message.index) &&
+            typeof message.body === "string"
+          )
+            await this.service.editDraft(message.index, message.body);
+          break;
         case "deleteDraft":
           if (Number.isInteger(message.index))
             await this.service.editDraft(message.index);
@@ -320,6 +361,11 @@ export class ReviewSidebar
     await this.refresh();
   }
   restored(result: string, title = "Back on your branch") {
+    const changed = this.service.lifecycle.changedPaths;
+    if (changed.length)
+      void vscode.window.showWarningMessage(
+        `Changes made during review were saved in a separate named stash: ${changed.join(", ")}`,
+      );
     const text =
       result === "conflict"
         ? `${title}. Your parked changes need conflict resolution; the named stash is kept.`

@@ -2,7 +2,6 @@ import * as path from "node:path";
 import { run } from "./cli";
 import { Commit, FileChange, ScopeRange } from "../core/model";
 import { parseBlame, parseChanges, parseHunks } from "../core/parsers";
-const exclusions = [":(exclude,glob).ide[a]/**", ":(exclude,glob).vscod[e]/**"];
 export class GitClient {
   constructor(
     readonly root: string,
@@ -35,11 +34,24 @@ export class GitClient {
     }
   }
   async dirtyFiles() {
-    return (await this.git("status", "--porcelain", "--", ".", ...exclusions))
+    return (await this.git("status", "--porcelain", "--untracked-files=all"))
       .split(/\r?\n/)
-      .filter(Boolean);
+      .filter((line) => !!line && !/^\?\? \.(?:vscode|idea)\//.test(line));
   }
   async stash(message: string) {
+    const scratch = (
+      await this.git(
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".vscode",
+        ".idea",
+      )
+    )
+      .split("\0")
+      .filter(Boolean);
     await this.git(
       "stash",
       "push",
@@ -48,8 +60,27 @@ export class GitClient {
       message,
       "--",
       ".",
-      ...exclusions,
+      ...scratch.map((file) => ":(exclude,literal)" + file),
     );
+  }
+  async parkBlocking(target: string, label: string): Promise<string[]> {
+    const changed = (await this.git("diff", "--name-only", "-z", "HEAD"))
+      .split("\0")
+      .filter(Boolean);
+    const moving = new Set(
+      (await this.git("diff", "--name-only", "-z", "HEAD", target)).split("\0"),
+    );
+    const paths = changed.filter((file) => moving.has(file));
+    if (paths.length)
+      await this.git(
+        "stash",
+        "push",
+        "-m",
+        "review-lens: changed during review of " + label,
+        "--",
+        ...paths.map((file) => ":(literal)" + file),
+      );
+    return paths;
   }
   async restoreStash(
     message: string,
@@ -143,6 +174,22 @@ export class GitClient {
         "--no-ext-diff",
         "--no-color",
         "--unified=0",
+        "-M",
+        range.from,
+        range.to,
+        "--",
+        ...(change.oldPath ? [change.oldPath] : []),
+        change.path,
+      ),
+    );
+  }
+  async commentHunks(range: ScopeRange, change: FileChange) {
+    return parseHunks(
+      await this.git(
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--unified=3",
         "-M",
         range.from,
         range.to,

@@ -45,9 +45,13 @@ each fork's editor integration should be checked before relying on it for review
 4. Read full files. The sidebar and Explorer show **★ not viewed**, **✓ viewed**, and **↻ changed since viewed**.
    Switch between changed files and the whole project. Gutter marks compare against the scope's base, and the caret
    line shows blame only for commits in that scope.
-5. Hover an added or modified line and use the comment gutter to write a **draft**. Use **Add draft comment** to save
-   it locally. Drafts can be edited or deleted inline or from the sidebar, and survive Exit.
-6. Use **Finish review** to send a summary, verdict and matching pending comments as one GitHub review. On your own
+5. Use the comment gutter on a changed diff block to write a **draft**, including a selection over several lines.
+   **Suggest a change** starts a suggestion from selected code. Drafts can be edited inline and survive Exit.
+   The **Comments** tab filters All / Open / Mine / Pending, including discussions outside the current scope.
+   Replies stay local until Finish; Resolve, Unresolve, and permitted edits or deletions update GitHub immediately.
+6. Use **Finish review** to send a summary, verdict, matching pending comments and replies as one GitHub review.
+   Finish adopts your existing pending review on GitHub; an older scope cannot add new comments to a pending review
+   targeting the latest push. Failed submissions retain local drafts and report any cleanup that needs attention. On your own
    PR only Comment is permitted. Empty Comment and Request changes reviews are held back with a reason.
    **Mark as reviewed** posts nothing and keeps drafts. Every finish restores your original branch and opens the list.
 7. **Exit** also restores your branch and work, retaining progress and drafts for a later review.
@@ -57,9 +61,15 @@ each fork's editor integration should be checked before relying on it for review
 | Mark viewed and advance | `Alt+R` |
 | Next unviewed file | `Alt+N` |
 | File / Diff | `Alt+D` |
+| Next unchecked impact place | `Alt+I` |
 
 The **Scope** action changes scope or fetches new commits. **Review Lens: Select Repository** switches repositories
 after the current review ends.
+
+Changed functions show an impact code lens when a language extension supplies document symbols and resolved references.
+Expand it to read callers and tests outside the PR, and manually check each place. Checks persist locally with a hash
+of the function. Groups with more than five places offer Find Usages. Searches stop waiting after about three seconds.
+Unavailable providers are reported explicitly; Refresh retries analysis. Removed functions are outside the VS Code v1 scope.
 
 ## Your work and data
 
@@ -67,13 +77,12 @@ Review Lens stores state in the checkout's own Git directory, under `review-lens
 Viewed state syncs through `gh`; offline changes are queued and retried on refresh or the next review.
 Drafts are pinned to file blobs: a draft written on another version stays pending until that version is reviewed again.
 
-Staged edits and untracked files are parked in a named Git stash. `.idea/` and `.vscode/` settings stay put.
+Staged edits and untracked files are parked in a named Git stash. Tracked settings files are parked too; only untracked `.idea/` and `.vscode/` scratch files stay put.
 Ignored files are not included in the stash. Do not run two editors' review lifecycles concurrently on the same checkout.
 
 The extension uses VS Code's in-session read-only editor command, preserving real file URIs and language navigation.
-On hosts without that command it opens immutable Git snapshot documents; language extensions may offer fewer features
-for those virtual documents. Native read-only protection covers editing in VS Code, not external tools, terminals, or
-a user explicitly overriding the editor's read-only state. Exit refuses to overwrite new review-checkout edits.
+The command is available throughout the supported VS Code versions. Immutable Git snapshot documents provide diff content. Native read-only protection covers editing in VS Code, not external tools, terminals, or
+a user explicitly overriding the editor's read-only state. Changes written during review that would block checkout are saved in a separate named stash and reported; they are not applied to your original branch.
 
 ## Troubleshooting
 

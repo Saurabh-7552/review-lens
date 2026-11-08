@@ -69,13 +69,20 @@ export interface BlameCommit {
 }
 export function parseBlame(text: string): Map<number, BlameCommit> {
   const result = new Map<number, BlameCommit>();
+  const commits = new Map<string, BlameCommit>();
   let commit: BlameCommit | undefined,
     line = 0;
   for (const row of text.split("\n")) {
     const match = /^([0-9a-f]{40}) \d+ (\d+)(?: \d+)?$/.exec(row);
     if (match) {
       line = Number(match[2]);
-      commit = { sha: match[1], author: "", time: 0, summary: "" };
+      commit = commits.get(match[1]) ?? {
+        sha: match[1],
+        author: "",
+        time: 0,
+        summary: "",
+      };
+      commits.set(match[1], commit);
     } else if (commit && row.startsWith("author "))
       commit.author = row.slice(7);
     else if (commit && row.startsWith("author-time "))

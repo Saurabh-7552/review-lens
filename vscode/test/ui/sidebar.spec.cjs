@@ -236,3 +236,84 @@ test("review, finish blockers, pending drafts, mark without posting, dark theme 
     ),
   ).toBe(true);
 });
+
+test("threads preserve typing on failure, filter discussions, confirm deletion and render suggestions safely", async ({
+  page,
+}) => {
+  const thread = {
+    id: "T1",
+    path: "calc.ts",
+    line: 2,
+    startLine: 1,
+    diffSide: "RIGHT",
+    originalText: "old <tag>",
+    comments: [
+      {
+        id: "C1",
+        author: "reviewer",
+        mine: true,
+        canEdit: true,
+        canDelete: true,
+        body: "```suggestion\nnew <script>alert(1)</script>\n```",
+        commit: loaded.head,
+      },
+    ],
+  };
+  const review = {
+    active: { target: target.target },
+    meta: {
+      target: target.target,
+      range: { from: loaded.mergeBase, to: loaded.head },
+      drafts: [],
+    },
+    threads: [thread],
+    changes: [],
+    viewed: 0,
+    pending: 0,
+  };
+  await state(page, review);
+  await page.getByRole("button", { name: "Comments", exact: true }).click();
+  await expect(page.locator(".suggestion .del")).toHaveText("old <tag>");
+  await expect(page.locator(".suggestion .add")).toContainText(
+    "new <script>alert(1)</script>",
+  );
+  expect(await page.locator(".suggestion script").count()).toBe(0);
+  await page
+    .getByRole("textbox", { name: "Reply to calc.ts" })
+    .fill("Keep this reply");
+  await state(page, { ...review, busy: true });
+  await state(page, { ...review, error: "GitHub refused" });
+  await expect(
+    page.getByRole("textbox", { name: "Reply to calc.ts" }),
+  ).toHaveValue("Keep this reply");
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "Edit posted comment" })
+    .fill("Edited public comment");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  expect(await page.evaluate(() => window.messages.at(-1))).toMatchObject({
+    action: "savePosted",
+    id: "C1",
+    body: "Edited public comment",
+  });
+  await state(page, { ...review, error: "Permission changed" });
+  await expect(
+    page.getByRole("textbox", { name: "Edit posted comment" }),
+  ).toHaveValue("Edited public comment");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Delete permanently" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Delete permanently" }),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "Pending", exact: true }).click();
+  await expect(page.getByText("No comments in this filter.")).toBeVisible();
+  await page.getByRole("button", { name: "All", exact: true }).click();
+  await page.screenshot({
+    path: ".artifacts/ui/comments-light.png",
+    fullPage: true,
+  });
+});

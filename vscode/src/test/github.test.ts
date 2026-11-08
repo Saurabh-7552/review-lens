@@ -16,14 +16,16 @@ test("GitHub calls paginate, send mutations as arguments, and pass review bodies
   await gh.setViewed(states.id, "a file with 'quotes'.txt", false);
   assert.ok(calls[1].args.includes("path=a file with 'quotes'.txt"));
   assert.match(calls[1].args.at(-1)!, /unmarkFileAsViewed/);
-  await gh.submit(1, { body: 'literal $() `command` "quotes"\nsecond line' });
+  await gh
+    .editComment("C1", 'literal $() \u0060command\u0060 "quotes"\nsecond line')
+    .catch(() => {});
   assert.deepEqual(calls[2].args.slice(-2), ["--input", "-"]);
   assert.equal(
-    JSON.parse(calls[2].input!).body,
-    'literal $() `command` "quotes"\nsecond line',
+    JSON.parse(calls[2].input!).variables.body,
+    'literal $() \u0060command\u0060 "quotes"\nsecond line',
   );
 });
-test("GitHub review refusals expose the reason without marking a review accepted", async () => {
+test("GitHub review refusals expose the reason", async () => {
   const gh = new GhClient("repo", async () => {
     throw new CliError(
       "gh",
@@ -32,5 +34,8 @@ test("GitHub review refusals expose the reason without marking a review accepted
       1,
     );
   });
-  await assert.rejects(gh.submit(7, {}), /Line could not be resolved/);
+  await assert.rejects(
+    gh.editComment("C1", "changed"),
+    /Line could not be resolved/,
+  );
 });

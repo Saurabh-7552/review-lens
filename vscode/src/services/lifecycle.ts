@@ -4,6 +4,7 @@ import { StateStore } from "../infrastructure/store";
 export type Restored = "nothing" | "restored" | "conflict" | "missing";
 /** A failure must never discard the only record of where the reviewer's work lives. */
 export class ReviewLifecycle {
+  changedPaths: string[] = [];
   constructor(
     readonly git: GitClient,
     readonly store: StateStore,
@@ -73,10 +74,7 @@ export class ReviewLifecycle {
     const active = await this.store.active();
     if (!active) throw new Error("No active review.");
     await this.assertCheckout(active);
-    if ((await this.git.dirtyFiles()).length)
-      throw new Error(
-        "The review checkout has edits. Keep them safe before changing scope.",
-      );
+    this.changedPaths = await this.git.parkBlocking(head, active.target.label);
     await this.git.checkoutAt(active.reviewBranch, head);
     try {
       const next = { ...active, head };
@@ -95,10 +93,10 @@ export class ReviewLifecycle {
       throw new Error(
         `The checkout is now ${current}. Return to ${active.reviewBranch} or ${active.originalRef} before restoring parked work.`,
       );
-    if (current === active.reviewBranch && (await this.git.dirtyFiles()).length)
-      throw new Error(
-        "The review checkout has edits. Save them in a separate stash before exiting; your original parked work is untouched.",
-      );
+    this.changedPaths =
+      current === active.reviewBranch
+        ? await this.git.parkBlocking(active.originalRef, active.target.label)
+        : [];
     await this.git.checkout(active.originalRef);
     const result = active.stashMessage
       ? await this.git.restoreStash(active.stashMessage)

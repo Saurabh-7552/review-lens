@@ -473,3 +473,37 @@ p {
 .scope-heading {
   margin-left: 0;
 }
+
+.posted + .posted {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.drafts textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 90px;
+  margin: 8px 0;
+}
+.suggestion {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin: 8px 0;
+  overflow: hidden;
+}
+.suggestion small {
+  display: block;
+  padding: 5px 8px;
+}
+.suggestion pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 7px 8px;
+  margin: 0;
+}
+.suggestion .del {
+  background: var(--vscode-diffEditor-removedTextBackground, #ff000018);
+}
+.suggestion .add {
+  background: var(--vscode-diffEditor-insertedTextBackground, #00ff0018);
+}

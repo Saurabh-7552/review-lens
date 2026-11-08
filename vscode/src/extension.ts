@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { GitClient } from "./infrastructure/git";
 import { ReviewService } from "./services/review";
 import { ReviewEditor } from "./ui/editor";
+import { ImpactMap } from "./ui/impact";
 import { ReviewSidebar } from "./ui/sidebar";
 import { badge, resolveScope, sinceLastReview } from "./core/model";
 
@@ -9,6 +10,7 @@ export interface ExtensionSession {
   service: ReviewService;
   editor: ReviewEditor;
   sidebar: ReviewSidebar;
+  impact: ImpactMap;
 }
 let session: ExtensionSession | undefined;
 let provider: vscode.Disposable | undefined;
@@ -85,18 +87,24 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!folder)
       throw new Error("Open a local Git repository folder to use Review Lens.");
     const git = await GitClient.discover(folder.uri.fsPath);
+    session?.impact.dispose();
     session?.sidebar.dispose();
     session?.editor.dispose();
     provider?.dispose();
     const service = new ReviewService(git),
-      editor = new ReviewEditor(service, context.extensionUri);
+      editor = new ReviewEditor(
+        service,
+        context.extensionUri,
+        context.workspaceState,
+      );
     const sidebar = new ReviewSidebar(
       service,
       editor,
       context.extensionUri,
       update,
     );
-    session = { service, editor, sidebar };
+    const impact = new ImpactMap(service, context.extensionUri);
+    session = { service, editor, sidebar, impact };
     provider = vscode.window.registerWebviewViewProvider(
       "reviewLens.review",
       sidebar,
@@ -120,7 +128,7 @@ export async function activate(context: vscode.ExtensionContext) {
         .then((choice) => {
           if (choice) void sidebar.reveal();
         });
-      void service.syncViewed();
+      void Promise.all([service.syncViewed(), service.refreshThreads()]);
     }
     return session;
   };
@@ -138,7 +146,11 @@ export async function activate(context: vscode.ExtensionContext) {
     const s = await setup();
     await s.sidebar.reveal();
   });
-  register("refresh", async () => (await ensure()).sidebar.refresh());
+  register("refresh", async () => {
+    const s = await ensure();
+    await s.sidebar.refresh();
+    await s.impact.refresh();
+  });
   register("nextFile", async () => {
     const s = await ensure(),
       next = s.service.next(current(s));
@@ -234,10 +246,53 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!(await s.editor.saveBuffers())) return;
     await s.service.begin(loaded, picked.scope);
     await update();
-    await s.service.syncViewed();
+    await Promise.all([s.service.syncViewed(), s.service.refreshThreads()]);
     const file = s.service.next() ?? s.service.changes[0];
     if (file) await s.editor.open(file.path);
   });
+  register("impactPeek", async (key: string) =>
+    (await ensure()).impact.peek(key),
+  );
+  register("impactToggle", async (key: string, place: string) =>
+    (await ensure()).impact.toggle(key, place),
+  );
+  register("impactOpen", async (key: string, place: string) =>
+    (await ensure()).impact.open(key, place),
+  );
+  register("impactUsages", async (key: string) =>
+    (await ensure()).impact.usages(key),
+  );
+  register("impactNext", async () => (await ensure()).impact.next());
+  register("suggest", async () => (await ensure()).editor.suggest());
+  register(
+    "resolveThread",
+    async (thread: vscode.CommentThread & { hostId: string }) =>
+      (await ensure()).service.resolveThread(thread.hostId, true),
+  );
+  register(
+    "unresolveThread",
+    async (thread: vscode.CommentThread & { hostId: string }) =>
+      (await ensure()).service.resolveThread(thread.hostId, false),
+  );
+  register("editPosted", async (comment: vscode.Comment & { id: string }) =>
+    (await ensure()).editor.editPosted(comment.id),
+  );
+  register("savePosted", async (comment: vscode.Comment & { id: string }) =>
+    (await ensure()).editor.savePosted(comment),
+  );
+  register("deletePosted", async (comment: vscode.Comment & { id: string }) =>
+    (await ensure()).editor.confirmDelete(comment, true),
+  );
+  register(
+    "cancelDeletePosted",
+    async (comment: vscode.Comment & { id: string }) =>
+      (await ensure()).editor.confirmDelete(comment, false),
+  );
+  register(
+    "confirmDeletePosted",
+    async (comment: vscode.Comment & { id: string }) =>
+      (await ensure()).service.postedComment(comment.id),
+  );
   register("finish", async () => (await ensure()).sidebar.reveal(true));
   register("exit", async () => {
     const s = await ensure();
@@ -258,15 +313,21 @@ export async function activate(context: vscode.ExtensionContext) {
       if (index === undefined) return;
       const draft = s.service.meta?.drafts?.[index];
       if (!draft || draft.posted) return;
-      const body = await vscode.window.showInputBox({
-        title: "Edit draft comment",
-        value: draft.body,
-        validateInput: (value) =>
-          value.trim() ? undefined : "Comment cannot be blank.",
-      });
-      if (body !== undefined) await s.service.editDraft(index, body);
+      await s.editor.editDraft(index);
     },
   );
+  register(
+    "saveComment",
+    async (comment: vscode.Comment & { index?: number }) => {
+      if (comment.index === undefined) return;
+      const s = await ensure();
+      const body =
+        typeof comment.body === "string" ? comment.body : comment.body.value;
+      await s.service.editDraft(comment.index, body);
+      await s.editor.cancelEdit();
+    },
+  );
+  register("cancelComment", async () => (await ensure()).editor.cancelEdit());
   register(
     "deleteComment",
     async (comment: vscode.Comment & { index?: number }) => {
@@ -286,6 +347,7 @@ export async function activate(context: vscode.ExtensionContext) {
   }
   context.subscriptions.push({
     dispose: () => {
+      session?.impact.dispose();
       session?.sidebar.dispose();
       session?.editor.dispose();
       provider?.dispose();
